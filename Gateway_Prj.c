@@ -21,6 +21,7 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include "gpio.h"
+#include <poll.h>
 
 /***************************************** PROTOTYPES **********************************/
 int main (int argc, char* const argv[]);
@@ -29,6 +30,8 @@ void ProcessSensorDataPackets (char* networkBuffer);
 void MotorControl (void);
 void InitSensorDB (void);
 int StringToInt (char *s, int n);
+void UpdateNetworkLed (char * pCmd);
+void InitNetworkStatusIndication (void);
 
 
 /**************************** SENSOR DATA PACKET PARSING *******************************/
@@ -89,9 +92,16 @@ typedef struct {
 sHumidity_t HumidityValue[TOTAL_HUMIDITY_SENSORS];
 
 
+/************************************* NETWORK LED CONTROL *****************************/
+#define NETWORK_STATUS_UNINITIALIZED			"none"
+#define NETWORK_STATUS_SOCKET_INITIALIZED		"default-on"
+#define NETWORK_STATUS_SOCKET_FAILED			"none"
+#define NETWORK_STATUS_CONNECTED				"heartbeat"
+#define NETWORK_STATUS_CONNECTION_TIMEOUT		"default-on"
+#define NETWORK_STATUS_CONNECTION_BREAK			"default-on"
+
+
 /**************************** SYSTEM CALL RETURN TYPES ********************************/
-#define handle_error(msg) \
-           do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
 typedef enum
 {
@@ -117,6 +127,24 @@ int StringToInt (char *s, int n)
 
 
 /************************************* THREADS and APIs ********************************/
+
+/*
+ * Update Network LED status
+ */
+void UpdateNetworkLed (char * pCmd)
+{
+	write_trigger_values (NETWORK_STATUS_INDICATION_1, pCmd);
+	write_trigger_values (NETWORK_STATUS_INDICATION_2, pCmd);
+}
+
+/*
+ * Initialize Network Status indications
+ */
+void InitNetworkStatusIndication (void)
+{
+	write_trigger_values (NETWORK_STATUS_INDICATION_1, "none");
+	write_trigger_values (NETWORK_STATUS_INDICATION_2, "none");
+}
 
 
 /*
@@ -192,13 +220,20 @@ void* networkThread (void * arg)
 	struct sockaddr_in clientName;
 	socklen_t clientAddrLen;
 
+	int nfds = 1; // Server and Client sockets
+	struct pollfd pollStruct;
+	struct pollfd *pfds = &pollStruct;
+
 	printf("\n\rData Concentrator: Starting Network Thread...");
+	InitNetworkStatusIndication();
+	UpdateNetworkLed (NETWORK_STATUS_UNINITIALIZED);
 
 	// Create socket
 	serverSocket_fd = socket (PF_INET, SOCK_STREAM, 0);
 	if (serverSocket_fd == RETVAL_ERR_SOCKETS)
 	{
-		printf("\n\rNetwork Thread failed to create Socket ! Entering dead loop...");
+		printf("\nNetwork Thread failed to create Socket ! Entering dead loop...");
+		UpdateNetworkLed (NETWORK_STATUS_SOCKET_FAILED);
 		for (;;){sleep(5);}
 	}
 
@@ -211,38 +246,73 @@ void* networkThread (void * arg)
 	// Bind address to Socket
 	if (RETVAL_ERR_SOCKETS == bind (serverSocket_fd, (struct sockaddr*) &name, sizeof(name)))
 	{
-		handle_error("bind");
+		perror("\n\rError: ");
 		printf("\n\rNetwork Thread failed to Bind address to Socket ! Entering dead loop...");
+		UpdateNetworkLed (NETWORK_STATUS_SOCKET_FAILED);
 		for (;;){sleep(5);}
 	}
 
 	// Listen to incoming connections
-	if (RETVAL_ERR_SOCKETS == listen (serverSocket_fd, 2))
+	if (RETVAL_ERR_SOCKETS == listen (serverSocket_fd, 10))
 	{
+		perror("\n\rError: ");
 		printf("\n\rNetwork Thread failed to listen (mark socket as passive) on Socket ! Entering dead loop...");
+		UpdateNetworkLed (NETWORK_STATUS_SOCKET_FAILED);
 		for (;;){sleep(5);}
 	}
 
 	printf("\n\rData Concentrator: Network Thread ==> Waiting for new connection");
+	UpdateNetworkLed (NETWORK_STATUS_SOCKET_INITIALIZED);
 
-	clientSocket_fd = accept (serverSocket_fd, (struct sockaddr *)&clientName, &clientAddrLen);
-	if (clientSocket_fd > 0)
+	for (;;)
 	{
-		printf("\nNetwork Thread Accepted a connection request !");
+		clientSocket_fd = accept (serverSocket_fd, (struct sockaddr *)&clientName, &clientAddrLen);
 
-		for (;;)
+		if (clientSocket_fd > 0)
 		{
-			memset (bufferIn, '\0', NETWORK_BUFFER_TOTAL_LEN);
-			read (clientSocket_fd, bufferIn, NETWORK_BUFFER_TOTAL_LEN);
-			printf("\n\n\rReceived message: %s",bufferIn);
-			// Process Sensor Data packets
-			ProcessSensorDataPackets (bufferIn);
+			UpdateNetworkLed (NETWORK_STATUS_CONNECTED);
+			printf("\nNetwork Thread Accepted a connection request !");
+
+			pfds->fd = clientSocket_fd;
+			pfds->events = (POLLIN | POLLHUP | POLLERR);
+			pfds->revents = 0;
+			nfds = 1;
+
+			for (;;)
+			{
+				poll(pfds, nfds, -1); // Wait for events on Socket
+
+				if ((pfds->revents & POLLHUP) || (pfds->revents & POLLERR))
+				{
+					printf ("\n\r POLLHUP");
+					printf ("\n\rDetected Connection break !");
+					break;
+				}
+				else if (pfds->revents & POLLIN)
+				{
+					printf ("\n\r POLLIN");
+					memset (bufferIn, '\0', NETWORK_BUFFER_TOTAL_LEN);
+					read (clientSocket_fd, bufferIn, NETWORK_BUFFER_TOTAL_LEN);
+					printf("\n\n\rReceived message: %s",bufferIn);
+					// Process Sensor Data packets
+					ProcessSensorDataPackets (bufferIn);
+				}
+				else
+				{
+					printf ("\n\r Other.. %d", pfds->revents);
+				}
+				pfds->revents = 0;
+			}
+
+			close (clientSocket_fd);
+			UpdateNetworkLed (NETWORK_STATUS_CONNECTION_BREAK);
+			printf ("\n\rListening for new connection request...");
 		}
-	}
-	else
-	{
-		printf("\nNetwork Thread failed to accept incoming connection ! Entering dead loop...");
-		for (;;){sleep(5);}
+		else
+		{
+			printf("\nNetwork Thread failed to accept incoming connection ! Entering dead loop...");
+			for (;;){sleep(5);}
+		}
 	}
 }
 
